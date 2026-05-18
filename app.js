@@ -767,7 +767,9 @@ function toDateKey(value) {
 }
 
 function dateToKey(d) { return `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, '0')}${String(d.getDate()).padStart(2, '0')}`; }
-function keyToDate(key) { return new Date(Number(key.slice(0, 4)), Number(key.slice(4, 6)) - 1, Number(key.slice(6, 8))); }
+function keyToDate(key) {
+  return `${key.slice(0, 4)}.${key.slice(4, 6)}.${key.slice(6, 8)}`;
+}
 function dateDisplay(key) { return `${Number(key.slice(4, 6))}/${Number(key.slice(6, 8))}`; }
 
 function toMoney(value) {
