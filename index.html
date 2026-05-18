@@ -1,0 +1,871 @@
+/* global XLSX, ExcelJS, saveAs */
+
+const CAR_SHEET_KEY = '자가용';
+const TRANSIT_SHEET_KEY = '대중교통';
+const TEMPLATE_DB_SHEET = 'DB';
+const CAR_START_ROW = 27;
+const CAR_END_ROW = 67;
+const TRANSIT_START_ROW = 21;
+const TRANSIT_END_ROW = 33;
+
+const TRAIN_KEYWORDS = /SR|SRT|KTX|코레일|한국철도|KORAIL|레츠코레일/i;
+const FUEL_KEYWORDS = /주유|충전|가스|휘발|경유|오일|GS칼텍스|SK에너지|SK네트웍스|S-OIL|에스오일|현대오일|HD현대|LPG|석유|알뜰주유/i;
+const TOLL_KEYWORDS = /하이패스|고속도로|통행료|톨게이트|한국도로공사/i;
+
+const els = {
+  addressFile: document.getElementById('addressFile'),
+  templateFile: document.getElementById('templateFile'),
+  visitFile: document.getElementById('visitFile'),
+  attendanceFile: document.getElementById('attendanceFile'),
+  cardFile: document.getElementById('cardFile'),
+  analyzeBtn: document.getElementById('analyzeBtn'),
+  generateBtn: document.getElementById('generateBtn'),
+  resetBtn: document.getElementById('resetBtn'),
+  statusBadge: document.getElementById('statusBadge'),
+  log: document.getElementById('log'),
+  downloadLink: document.getElementById('downloadLink'),
+  preview: document.getElementById('preview'),
+  employeeName: document.getElementById('employeeName'),
+  carCount: document.getElementById('carCount'),
+  trainCount: document.getElementById('trainCount'),
+  fuelTotal: document.getElementById('fuelTotal')
+};
+
+els.analyzeBtn.addEventListener('click', () => run(false));
+els.generateBtn.addEventListener('click', () => run(true));
+els.resetBtn.addEventListener('click', resetAll);
+
+function resetAll() {
+  ['addressFile', 'templateFile', 'visitFile', 'attendanceFile', 'cardFile'].forEach(id => { els[id].value = ''; });
+  setBadge('amber', '대기');
+  els.log.textContent = '파일을 올린 뒤 [분석/미리보기] 또는 [완성본 생성]을 누르세요.';
+  els.downloadLink.hidden = true;
+  els.preview.style.display = 'none';
+  updateKpi('-', 0, 0, 0);
+}
+
+function setBusy(flag) {
+  els.analyzeBtn.disabled = flag;
+  els.generateBtn.disabled = flag;
+}
+
+function setBadge(type, text) {
+  els.statusBadge.className = `badge ${type}`;
+  els.statusBadge.textContent = text;
+}
+
+function log(message = '') {
+  els.log.textContent += `\n${message}`;
+  els.log.scrollTop = els.log.scrollHeight;
+}
+
+function clearLog() {
+  els.log.textContent = '';
+  els.downloadLink.hidden = true;
+  els.preview.style.display = 'none';
+}
+
+function updateKpi(employeeName, carCount, trainCount, fuelTotal) {
+  els.employeeName.textContent = employeeName || '-';
+  els.carCount.textContent = String(carCount || 0);
+  els.trainCount.textContent = String(trainCount || 0);
+  els.fuelTotal.textContent = formatWon(fuelTotal || 0);
+}
+
+async function run(shouldGenerate) {
+  clearLog();
+  setBusy(true);
+  setBadge('amber', shouldGenerate ? '생성 중' : '분석 중');
+  try {
+    const files = getFiles();
+    log('✅ 파일 5개 확인 완료');
+
+    const buffers = {
+      address: await files.address.arrayBuffer(),
+      template: await files.template.arrayBuffer(),
+      visit: await files.visit.arrayBuffer(),
+      attendance: await files.attendance.arrayBuffer(),
+      card: await files.card.arrayBuffer()
+    };
+
+    const templateXlsx = XLSX.read(buffers.template.slice(0), { type: 'array', cellDates: false });
+    const templateExcel = new ExcelJS.Workbook();
+    await templateExcel.xlsx.load(buffers.template.slice(0));
+    const employeeName = extractEmployeeName(templateExcel, templateXlsx);
+    if (!employeeName) throw new Error('이동 양식에서 작성자 이름을 찾지 못했습니다. F4 또는 F3에 작성자가 있어야 합니다.');
+    log(`👤 작성자 자동 인식: ${employeeName}`);
+
+    const addressBook = XLSX.read(buffers.address, { type: 'array', cellDates: false });
+    const visitBook = XLSX.read(buffers.visit, { type: 'array', cellDates: false });
+    const attendanceBook = XLSX.read(buffers.attendance, { type: 'array', cellDates: false });
+    const cardBook = XLSX.read(buffers.card, { type: 'array', cellDates: false });
+
+    const addressDb = parseAddressDb(addressBook, employeeName);
+    const attendanceRows = parseAttendanceRows(attendanceBook, addressDb, employeeName);
+    addressDb.defaultOffice = detectDefaultOffice(addressDb, attendanceRows);
+    const visitRows = parseVisitRows(visitBook, addressDb, employeeName);
+    const cardRows = parseCardRows(cardBook);
+    const dbRoutes = buildDbRouteMap(templateXlsx, addressDb);
+
+    log(`🏠 자택 기준: ${addressDb.home.address}`);
+    log(`🏢 기본 사무실 기준: ${addressDb.defaultOffice?.name || '인식 실패 - 자택 기준 우선'}`);
+    log(`📍 방문활동 ${visitRows.length}건 / 근태 ${attendanceRows.size}일 / 카드 ${cardRows.length}건 인식`);
+
+    const plan = buildExpensePlan({ visitRows, attendanceRows, cardRows, addressDb });
+    const fuelSum = cardRows.filter(r => r.isFuel).reduce((s, r) => s + r.amount, 0);
+    updateKpi(employeeName, plan.carRows.length, plan.trainRows.length, fuelSum);
+    renderPreview(plan, addressDb);
+    printPlan(plan);
+
+    if (!shouldGenerate) {
+      setBadge('green', '분석 완료');
+      return;
+    }
+
+    log('\n🚗 TMAP 거리 계산 시작');
+    await fillRouteDistances(plan.carRows, addressDb, dbRoutes);
+
+    writeWorkbook(templateExcel, plan, addressDb, employeeName, files.template.name);
+    const output = await templateExcel.xlsx.writeBuffer();
+    const blob = new Blob([output], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+    const fileName = makeOutputName(plan, employeeName);
+    const url = URL.createObjectURL(blob);
+    els.downloadLink.href = url;
+    els.downloadLink.download = fileName;
+    els.downloadLink.textContent = `완성본 다운로드: ${fileName}`;
+    els.downloadLink.hidden = false;
+    setBadge('green', '생성 완료');
+    log(`\n✅ 완성본 생성 완료: ${fileName}`);
+    log('보호 규칙: 자가용 G열/H열은 지우거나 쓰지 않습니다.');
+  } catch (err) {
+    console.error(err);
+    setBadge('red', '오류');
+    log(`\n❌ 오류: ${err.message || err}`);
+  } finally {
+    setBusy(false);
+  }
+}
+
+function getFiles() {
+  const list = [
+    ['address', els.addressFile.files[0], '주소DB'],
+    ['template', els.templateFile.files[0], '이동 양식'],
+    ['visit', els.visitFile.files[0], '방문활동관리'],
+    ['attendance', els.attendanceFile.files[0], '근태관리'],
+    ['card', els.cardFile.files[0], '카드승인내역']
+  ];
+  const missing = list.filter(([, file]) => !file).map(([, , label]) => label);
+  if (missing.length) throw new Error(`파일이 부족합니다: ${missing.join(', ')}`);
+  return Object.fromEntries(list.map(([key, file]) => [key, file]));
+}
+
+function extractEmployeeName(excelBook, sheetBook) {
+  const carSheet = excelBook.worksheets.find(ws => ws.name.includes(CAR_SHEET_KEY)) || excelBook.worksheets[0];
+  const candidates = ['F4', 'F3', 'E4', 'E3', 'D4', 'D3'];
+  for (const addr of candidates) {
+    const value = cellTextExcel(carSheet.getCell(addr).value);
+    if (looksLikePersonName(value)) return normalizePersonName(value);
+  }
+
+  // 작성자 텍스트 오른쪽 근처에서 재탐색
+  for (let r = 1; r <= 8; r += 1) {
+    for (let c = 1; c <= 8; c += 1) {
+      const value = cellTextExcel(carSheet.getCell(r, c).value);
+      if (value.includes('작성자')) {
+        for (let cc = c + 1; cc <= Math.min(c + 4, 10); cc += 1) {
+          const nearby = cellTextExcel(carSheet.getCell(r, cc).value);
+          if (looksLikePersonName(nearby)) return normalizePersonName(nearby);
+        }
+      }
+    }
+  }
+
+  const wsName = sheetBook.SheetNames.find(n => n.includes(CAR_SHEET_KEY)) || sheetBook.SheetNames[0];
+  const ws = sheetBook.Sheets[wsName];
+  for (const addr of candidates) {
+    const value = String(ws?.[addr]?.v || '').trim();
+    if (looksLikePersonName(value)) return normalizePersonName(value);
+  }
+  return '';
+}
+
+function looksLikePersonName(value) {
+  const text = String(value || '').trim();
+  if (!text) return false;
+  if (/[0-9]|년도|월|부서|작성자|SE운영팀|사용/.test(text)) return false;
+  return text.length >= 2 && text.length <= 12;
+}
+
+function cellTextExcel(value) {
+  if (value == null) return '';
+  if (typeof value === 'object') {
+    if (value.text) return String(value.text).trim();
+    if (value.richText) return value.richText.map(r => r.text || '').join('').trim();
+    if (value.result != null) return String(value.result).trim();
+    if (value.formula && value.result != null) return String(value.result).trim();
+  }
+  return String(value).trim();
+}
+
+function sheetAoA(workbook, preferredName = null) {
+  const name = preferredName && workbook.SheetNames.includes(preferredName) ? preferredName : workbook.SheetNames[0];
+  const ws = workbook.Sheets[name];
+  if (!ws) throw new Error(`시트를 찾을 수 없습니다: ${preferredName || '첫 번째 시트'}`);
+  return XLSX.utils.sheet_to_json(ws, { header: 1, raw: false, defval: '' });
+}
+
+function normalizeHeader(value) {
+  return String(value || '').replace(/\s+/g, '').replace(/[()（）]/g, '').trim();
+}
+
+function findHeaderRow(aoa, requiredGroups) {
+  const groups = requiredGroups.map(g => Array.isArray(g) ? g : [g]).map(g => g.map(normalizeHeader));
+  for (let i = 0; i < Math.min(30, aoa.length); i += 1) {
+    const row = aoa[i].map(normalizeHeader);
+    const ok = groups.every(group => group.some(h => row.includes(h)));
+    if (ok) return i;
+  }
+  throw new Error(`헤더를 찾지 못했습니다: ${requiredGroups.map(g => Array.isArray(g) ? g.join('/') : g).join(', ')}`);
+}
+
+function objectsFromWorkbook(workbook, requiredGroups, preferredSheetName = null) {
+  const sheetName = preferredSheetName && workbook.SheetNames.includes(preferredSheetName) ? preferredSheetName : workbook.SheetNames[0];
+  const aoa = sheetAoA(workbook, sheetName);
+  const headerIdx = findHeaderRow(aoa, requiredGroups);
+  const rawHeaders = aoa[headerIdx].map(v => String(v || '').trim());
+  return aoa.slice(headerIdx + 1)
+    .filter(row => row.some(v => String(v || '').trim() !== ''))
+    .map((row, idx) => {
+      const obj = { __rowNo: headerIdx + idx + 2 };
+      rawHeaders.forEach((h, colIdx) => {
+        if (!h) return;
+        obj[h] = row[colIdx] ?? '';
+        obj[normalizeHeader(h)] = row[colIdx] ?? '';
+      });
+      return obj;
+    });
+}
+
+function getField(row, names) {
+  for (const name of names) {
+    const keys = [name, normalizeHeader(name)];
+    for (const key of keys) {
+      if (row[key] !== undefined && String(row[key]).trim() !== '') return row[key];
+    }
+  }
+  return '';
+}
+
+function parseAddressDb(workbook, employeeName) {
+  const rows = objectsFromWorkbook(workbook, ['구분', '이름', '표시명', '주소'], workbook.SheetNames.includes('주소DB') ? '주소DB' : null);
+  const locations = new Map();
+  const aliasToName = new Map();
+  const warnings = [];
+  let home = null;
+  let personalOffice = null;
+
+  const addAlias = (alias, canonical) => {
+    const key = normalizeKey(alias);
+    if (key && !aliasToName.has(key)) aliasToName.set(key, canonical);
+  };
+
+  const addLocation = (loc) => {
+    const canonical = normalizeDisplayName(loc.name);
+    const city = loc.city || inferCity(canonical, loc.address);
+    const fullAddress = makeFullAddress(loc.address, city);
+    const item = { ...loc, name: canonical, city, address: fullAddress, cityKey: cityKey(city || fullAddress) };
+    locations.set(canonical, item);
+    addAlias(canonical, canonical);
+    return item;
+  };
+
+  rows.forEach(row => {
+    const typeRaw = String(getField(row, ['구분']) || '').trim();
+    const typeKey = normalizeKey(typeRaw);
+    const person = String(getField(row, ['이름']) || '').trim();
+    const display = String(getField(row, ['표시명', '장소명', '점포명']) || '').trim();
+    const address = String(getField(row, ['주소', '상세주소']) || '').trim();
+    const city = String(getField(row, ['시도', '시군구', '지역']) || '').trim();
+    const aliases = String(getField(row, ['별칭', 'alias', 'Alias']) || '').trim();
+    if (!typeRaw || !display || !address) return;
+
+    if (typeKey.includes('자택')) {
+      if (samePerson(person, employeeName)) {
+        home = addLocation({ type: '자택', personName: person, name: '자택', displayName: display, address, city });
+        [display, person, `${person}자택`, `${person}집`, '자택', '집', '우리집', aliases].forEach(a => addAlias(a, home.name));
+      }
+      return;
+    }
+
+    const isOffice = typeKey.includes('사무');
+    const isStore = typeKey.includes('매장') || display.includes('코스트코');
+    const loc = addLocation({ type: isOffice ? '사무실' : (isStore ? '매장' : typeRaw), personName: person, name: display, displayName: display, address, city });
+    addPlaceAliases(display, loc.name, loc.type, addAlias);
+    splitAliases(aliases).forEach(alias => addPlaceAliases(alias, loc.name, loc.type, addAlias));
+    if (isOffice && samePerson(person, employeeName)) personalOffice = loc;
+  });
+
+  if (!home) throw new Error(`주소DB에서 작성자 ${employeeName}의 자택을 찾지 못했습니다. 구분=자택, B열 이름=${employeeName} 행이 필요합니다.`);
+
+  // 혁신점 별칭 보강
+  const innovation = [...locations.keys()].find(n => normalizeKey(n).includes('혁신'));
+  if (innovation) ['코스트코 대구혁신점', '대구혁신점', '혁신점', '코스트코 혁신점'].forEach(a => addAlias(a, innovation));
+  else warnings.push('주소DB에 코스트코 혁신점이 없어 주유만 있는 날 기본 방문지 처리 시 확인이 필요합니다.');
+
+  return { locations, aliasToName, warnings, home, personalOffice, defaultOffice: personalOffice };
+}
+
+function addPlaceAliases(name, canonical, type, addAlias) {
+  const text = String(name || '').trim();
+  if (!text) return;
+  addAlias(text, canonical);
+  addAlias(text.replace(/\s+/g, ''), canonical);
+
+  if (type === '사무실') {
+    addAlias(text.replace(/사무소/g, '사무실'), canonical);
+    addAlias(text.replace(/사무실/g, '사무소'), canonical);
+    const area = text.replace(/\(.*?\)/g, '').replace(/사무실|사무소/g, '').trim();
+    if (area) [`${area}사무실`, `${area} 사무실`, `${area}사무소`, `${area} 사무소`].forEach(a => addAlias(a, canonical));
+  }
+
+  if (type === '매장') {
+    const store = text.replace(/코스트코/g, '').replace(/점$/g, '').trim();
+    if (store) {
+      [store, `${store}점`, `코스트코${store}`, `코스트코${store}점`, `코스트코 ${store}`, `코스트코 ${store}점`].forEach(a => addAlias(a, canonical));
+      if (store.includes('혁신')) ['대구혁신점', '코스트코 대구혁신점'].forEach(a => addAlias(a, canonical));
+    }
+  }
+}
+
+function splitAliases(text) {
+  return String(text || '').split(/[,，\/|;；\n]+/).map(v => v.trim()).filter(Boolean);
+}
+
+function parseVisitRows(workbook, addressDb, employeeName) {
+  const rows = objectsFromWorkbook(workbook, ['방문날짜', '방문시간', '매장명']);
+  return rows.map(row => {
+    const rowName = normalizePersonName(getField(row, ['이름', '성명', '작성자']));
+    return {
+      dateKey: toDateKey(getField(row, ['방문날짜', '날짜'])),
+      time: String(getField(row, ['방문시간', '시간']) || '').trim(),
+      store: resolvePlaceName(getField(row, ['매장명', '점포명', '방문지']), addressDb),
+      rawStore: String(getField(row, ['매장명', '점포명', '방문지']) || '').trim(),
+      name: rowName
+    };
+  })
+  .filter(r => r.dateKey && r.store && (!r.name || samePerson(r.name, employeeName)))
+  .sort((a, b) => `${a.dateKey}${a.time}`.localeCompare(`${b.dateKey}${b.time}`));
+}
+
+function parseAttendanceRows(workbook, addressDb, employeeName) {
+  const rows = objectsFromWorkbook(workbook, ['근무일자', '출근지점', '퇴근지점']);
+  const byDate = new Map();
+  rows.forEach(row => {
+    const rowName = normalizePersonName(getField(row, ['이름', '성명', '작성자']));
+    if (rowName && !samePerson(rowName, employeeName)) return;
+    const dateKey = toDateKey(getField(row, ['근무일자', '날짜']));
+    if (!dateKey) return;
+    const rawStart = String(getField(row, ['출근지점', '출근장소']) || '').trim();
+    const rawEnd = String(getField(row, ['퇴근지점', '퇴근장소']) || '').trim();
+    byDate.set(dateKey, {
+      dateKey,
+      start: rawStart ? resolvePlaceName(rawStart, addressDb) : '',
+      end: rawEnd ? resolvePlaceName(rawEnd, addressDb) : '',
+      rawStart,
+      rawEnd
+    });
+  });
+  return byDate;
+}
+
+function parseCardRows(workbook) {
+  const rows = objectsFromWorkbook(workbook, [['승인일자', '이용일자', '사용일자'], ['가맹점명', '가맹점', '사용처'], ['승인금액(원화)', '승인금액', '이용금액', '금액']]);
+  return rows.map(row => {
+    const merchant = String(getField(row, ['가맹점명', '가맹점', '사용처', '상호']) || '').trim();
+    const amount = toMoney(getField(row, ['승인금액(원화)', '승인금액', '이용금액', '금액']));
+    const vat = toMoney(getField(row, ['부가세', 'VAT']));
+    const cancelText = String(getField(row, ['취소여부', '승인구분', '상태']) || '').trim().toUpperCase();
+    const dateKey = toDateKey(getField(row, ['승인일자', '이용일자', '사용일자', '거래일자']));
+    const time = String(getField(row, ['승인시간', '이용시간', '사용시간', '거래시간']) || '').trim();
+    return {
+      dateKey,
+      time,
+      merchant,
+      amount,
+      vat,
+      isCanceled: cancelText === 'Y' || cancelText.includes('취소') || cancelText.includes('CANCEL'),
+      isTrain: TRAIN_KEYWORDS.test(merchant),
+      isFuel: FUEL_KEYWORDS.test(merchant),
+      isToll: TOLL_KEYWORDS.test(merchant),
+      trainType: trainType(merchant)
+    };
+  }).filter(r => r.dateKey && r.amount > 0 && !r.isCanceled);
+}
+
+function detectDefaultOffice(addressDb, attendanceRows) {
+  if (addressDb.personalOffice) return addressDb.personalOffice;
+  const counts = new Map();
+  attendanceRows.forEach(row => {
+    const loc = addressDb.locations.get(row.start);
+    if (loc?.type === '사무실') counts.set(loc.name, (counts.get(loc.name) || 0) + 1);
+  });
+  const best = [...counts.entries()].sort((a, b) => b[1] - a[1])[0]?.[0];
+  if (best) return addressDb.locations.get(best);
+
+  // 자택과 같은 광역/시의 사무실을 기본으로 추정
+  const homeCity = addressDb.home.cityKey;
+  const sameCityOffice = [...addressDb.locations.values()].find(loc => loc.type === '사무실' && loc.cityKey === homeCity);
+  if (sameCityOffice) return sameCityOffice;
+  return [...addressDb.locations.values()].find(loc => loc.type === '사무실') || null;
+}
+
+function buildExpensePlan({ visitRows, attendanceRows, cardRows, addressDb }) {
+  const visitsByDate = groupBy(visitRows, r => r.dateKey);
+  const cardsByDate = groupBy(cardRows, r => r.dateKey);
+  const carRows = [];
+  const trainRows = [];
+  const warnings = [...addressDb.warnings];
+  const dates = new Set([...visitsByDate.keys(), ...attendanceRows.keys(), ...cardsByDate.keys()]);
+
+  [...dates].sort().forEach(dateKey => {
+    const cards = (cardsByDate.get(dateKey) || []).slice().sort((a, b) => String(a.time).localeCompare(String(b.time)));
+    const trainCards = cards.filter(c => c.isTrain);
+    const fuelTotal = cards.filter(c => c.isFuel).reduce((sum, c) => sum + c.amount, 0);
+    const tollTotal = cards.filter(c => c.isToll).reduce((sum, c) => sum + c.amount, 0);
+
+    if (trainCards.length) {
+      const target = trainTarget(dateKey, visitsByDate, attendanceRows, addressDb);
+      trainCards.forEach((card, idx) => {
+        const isReturn = idx % 2 === 1;
+        const first = target.sequence[0] || target.attendanceStart || target.attendanceEnd || '자택';
+        const last = target.sequence[target.sequence.length - 1] || target.attendanceEnd || first;
+        const from = isReturn ? last : '자택';
+        const to = isReturn ? '자택' : first;
+        const firstLoc = addressDb.locations.get(first);
+        const baseReason = firstLoc?.type === '사무실' ? '회의 및 교육' : '매장 점검';
+        trainRows.push({
+          dateKey,
+          item: card.trainType,
+          destination: `${cityShort(from, addressDb)}에서 ${cityShort(to, addressDb)}까지`,
+          reason: isReturn ? `${baseReason} 후 자택 복귀 이동` : `${baseReason}을 위한 이동`,
+          amount: card.amount,
+          merchant: card.merchant
+        });
+      });
+      if (fuelTotal) warnings.push(`${dateDisplay(dateKey)} 기차 결제일이라 주유 ${formatWon(fuelTotal)}은 자가용에서 제외했습니다.`);
+      return;
+    }
+
+    const visits = (visitsByDate.get(dateKey) || []).slice().sort((a, b) => String(a.time).localeCompare(String(b.time)));
+    const attendance = attendanceRows.get(dateKey) || null;
+    if (!visits.length && !fuelTotal && !attendance?.end) return;
+
+    const start = resolveCarStart(attendance, addressDb);
+    const sequence = [];
+    visits.forEach(v => pushUnique(sequence, v.store));
+
+    if (!sequence.length && fuelTotal) {
+      const innovation = resolvePlaceName('코스트코 혁신점', addressDb);
+      if (innovation) {
+        sequence.push(innovation);
+        warnings.push(`${dateDisplay(dateKey)} 주유 결제는 있으나 방문활동이 없어 ${innovation} 기준으로 방문활동 생성`);
+      }
+    }
+
+    // 방문활동에 없는데 퇴근지점이 있으면 마지막 경유지로 추가
+    if (attendance?.end && attendance.end !== start && sequence[sequence.length - 1] !== attendance.end) {
+      pushUnique(sequence, attendance.end);
+    }
+
+    if (!sequence.length) return;
+
+    let prev = start;
+    sequence.forEach((dest, idx) => {
+      if (prev && dest && prev !== dest) {
+        carRows.push({ dateKey, start: prev, end: dest, fuelTotal: idx === 0 ? fuelTotal : 0, tollCard: idx === 0 ? tollTotal : 0, distanceKm: null, toll: null, source: '' });
+      }
+      prev = dest;
+    });
+
+    if (prev && shouldReturnHome(prev, addressDb)) {
+      carRows.push({ dateKey, start: prev, end: '자택', fuelTotal: 0, tollCard: 0, isReturnHome: true, distanceKm: null, toll: null, source: '' });
+    }
+  });
+
+  return { carRows, trainRows, warnings };
+}
+
+function resolveCarStart(attendance, addressDb) {
+  const defaultOfficeName = addressDb.defaultOffice?.name || '';
+  if (attendance?.start && defaultOfficeName && attendance.start === defaultOfficeName) return defaultOfficeName;
+  if (attendance?.start) {
+    const loc = addressDb.locations.get(attendance.start);
+    if (loc?.type === '사무실' && loc.name === defaultOfficeName) return loc.name;
+    return '자택';
+  }
+  return defaultOfficeName || '자택';
+}
+
+function trainTarget(dateKey, visitsByDate, attendanceRows, addressDb) {
+  const visits = (visitsByDate.get(dateKey) || []).slice().sort((a, b) => String(a.time).localeCompare(String(b.time)));
+  const attendance = attendanceRows.get(dateKey) || {};
+  const sequence = [];
+  visits.forEach(v => pushUnique(sequence, v.store));
+  if (!sequence.length && attendance.start) pushUnique(sequence, attendance.start);
+  if (attendance.end) pushUnique(sequence, attendance.end);
+  return { sequence, attendanceStart: attendance.start || '', attendanceEnd: attendance.end || '' };
+}
+
+function pushUnique(arr, value) {
+  if (!value) return;
+  if (arr.length && arr[arr.length - 1] === value) return;
+  arr.push(value);
+}
+
+function shouldReturnHome(lastPlace, addressDb) {
+  if (!lastPlace || lastPlace === '자택') return false;
+  const loc = addressDb.locations.get(lastPlace);
+  if (!loc) return true;
+  return loc.cityKey !== addressDb.home.cityKey;
+}
+
+async function fillRouteDistances(carRows, addressDb, dbRoutes) {
+  const cache = new Map();
+  let ok = 0;
+  let fallback = 0;
+  let fail = 0;
+
+  for (const row of carRows) {
+    const start = resolveLocation(row.start, addressDb);
+    const end = resolveLocation(row.end, addressDb);
+    const key = routeKey(start.name, end.name);
+    if (cache.has(key)) {
+      Object.assign(row, cache.get(key));
+      continue;
+    }
+
+    try {
+      const data = await fetchTmapRoute(start, end);
+      if (data.ok) {
+        const value = { distanceKm: round1(data.distanceKm), toll: Number(data.toll || 0), source: 'TMAP' };
+        Object.assign(row, value);
+        cache.set(key, value);
+        ok += 1;
+        log(`  ✅ ${start.name} → ${end.name}: ${value.distanceKm}km / 통행료 ${formatWon(value.toll)}`);
+        continue;
+      }
+      throw new Error(data.error || 'TMAP 실패');
+    } catch (err) {
+      const fb = dbRoutes.get(key) || dbRoutes.get(routeKey(end.name, start.name));
+      if (fb) {
+        const value = { distanceKm: round1(fb.distanceKm), toll: Number(fb.toll || 0), source: 'DB' };
+        Object.assign(row, value);
+        cache.set(key, value);
+        fallback += 1;
+        log(`  ⚠️ ${start.name} → ${end.name}: TMAP 실패, DB값 ${value.distanceKm}km 사용`);
+      } else {
+        row.distanceKm = 0;
+        row.toll = 0;
+        row.source = '확인필요';
+        fail += 1;
+        log(`  ❌ ${start.name} → ${end.name}: 거리 계산 실패 (${err.message || err})`);
+      }
+    }
+  }
+
+  if (ok && !fallback && !fail) setBadge('green', `TMAP 정상 ${ok}건`);
+  else if (ok || fallback) setBadge('amber', `TMAP ${ok}건 / DB대체 ${fallback}건`);
+  else setBadge('red', '거리 계산 확인 필요');
+}
+
+async function fetchTmapRoute(start, end) {
+  const res = await fetch('/api/tmap-route', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      start: { name: start.name, address: start.address, lon: start.lon, lat: start.lat },
+      end: { name: end.name, address: end.address, lon: end.lon, lat: end.lat }
+    })
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) return { ok: false, error: data.error || `HTTP ${res.status}` };
+  return data;
+}
+
+function writeWorkbook(workbook, plan, addressDb, employeeName, templateName) {
+  const carSheet = findWorksheet(workbook, CAR_SHEET_KEY);
+  const transitSheet = findWorksheet(workbook, TRANSIT_SHEET_KEY);
+  if (!carSheet) throw new Error('자가용 시트를 찾을 수 없습니다.');
+  if (!transitSheet) throw new Error('대중교통 시트를 찾을 수 없습니다.');
+
+  updateTitleMonth(carSheet, plan);
+  updateTitleMonth(transitSheet, plan);
+  clearCarRows(carSheet);
+  clearTransitRows(transitSheet);
+
+  if (plan.carRows.length > CAR_END_ROW - CAR_START_ROW + 1) throw new Error(`자가용 입력 행 초과: ${plan.carRows.length}건`);
+  if (plan.trainRows.length > TRANSIT_END_ROW - TRANSIT_START_ROW + 1) throw new Error(`대중교통 입력 행 초과: ${plan.trainRows.length}건`);
+
+  plan.carRows.forEach((item, idx) => {
+    const rowNo = CAR_START_ROW + idx;
+    const start = resolveLocation(item.start, addressDb);
+    const end = resolveLocation(item.end, addressDb);
+    setCell(carSheet, rowNo, 1, keyToDate(item.dateKey), 'yyyy.mm.dd');
+    setCell(carSheet, rowNo, 2, start.name);
+    setCell(carSheet, rowNo, 3, start.address);
+    setCell(carSheet, rowNo, 4, end.name);
+    setCell(carSheet, rowNo, 5, end.address);
+    setCell(carSheet, rowNo, 6, Number(item.distanceKm || 0), '0.0');
+    // 아래 J/M/N은 기존 양식 계산용. G/H는 절대 수정하지 않음.
+    setCell(carSheet, rowNo, 10, Number(item.toll || 0), '#,##0');
+    setCell(carSheet, rowNo, 13, item.fuelTotal ? Number(item.fuelTotal) : null, '#,##0');
+    setCell(carSheet, rowNo, 14, item.tollCard ? Number(item.tollCard) : Number(item.toll || 0), '#,##0');
+  });
+
+  plan.trainRows.forEach((item, idx) => {
+    const rowNo = TRANSIT_START_ROW + idx;
+    setCell(transitSheet, rowNo, 1, keyToDate(item.dateKey), 'yyyy.mm.dd');
+    setCell(transitSheet, rowNo, 2, item.item);
+    setCell(transitSheet, rowNo, 3, item.destination);
+    setCell(transitSheet, rowNo, 4, item.reason);
+    setCell(transitSheet, rowNo, 6, Number(item.amount || 0), '#,##0');
+    setCell(transitSheet, rowNo, 7, 0, '#,##0');
+  });
+
+  writeSummarySheet(workbook, plan, addressDb, employeeName, templateName);
+}
+
+function clearCarRows(sheet) {
+  // G열(연비), H열(유가)은 고정값이므로 절대 clear/write 하지 않는다.
+  const cols = [1, 2, 3, 4, 5, 6, 10, 13, 14];
+  for (let r = CAR_START_ROW; r <= CAR_END_ROW; r += 1) cols.forEach(c => { sheet.getCell(r, c).value = null; });
+}
+
+function clearTransitRows(sheet) {
+  const cols = [1, 2, 3, 4, 6, 7];
+  for (let r = TRANSIT_START_ROW; r <= TRANSIT_END_ROW; r += 1) cols.forEach(c => { sheet.getCell(r, c).value = null; });
+}
+
+function setCell(sheet, row, col, value, numFmt = null) {
+  const cell = sheet.getCell(row, col);
+  cell.value = value === undefined ? null : value;
+  if (numFmt) cell.numFmt = numFmt;
+}
+
+function updateTitleMonth(sheet, plan) {
+  const dateKey = plan.carRows[0]?.dateKey || plan.trainRows[0]?.dateKey;
+  if (!dateKey) return;
+  const y = dateKey.slice(0, 4);
+  const m = String(Number(dateKey.slice(4, 6)));
+  const cell = sheet.getCell('A1');
+  const text = cellTextExcel(cell.value);
+  if (text.includes('년도')) cell.value = text.replace(/\d{4}년도\s*\(\s*\d+\s*\)월/, `${y}년도 ( ${m} )월`);
+}
+
+function writeSummarySheet(workbook, plan, addressDb, employeeName, templateName) {
+  let sheet = workbook.getWorksheet('자동생성_요약');
+  if (!sheet) sheet = workbook.addWorksheet('자동생성_요약');
+  if (sheet.rowCount > 0) sheet.spliceRows(1, sheet.rowCount);
+  sheet.columns = [{ width: 24 }, { width: 110 }];
+  sheet.addRows([
+    ['생성일시', new Date().toLocaleString('ko-KR')],
+    ['원본 양식', templateName],
+    ['작성자', employeeName],
+    ['자택 기준', `${addressDb.home.name} / ${addressDb.home.address}`],
+    ['기본 사무실 기준', addressDb.defaultOffice ? `${addressDb.defaultOffice.name} / ${addressDb.defaultOffice.address}` : '미인식'],
+    ['자가용 입력 행', plan.carRows.length],
+    ['대중교통 입력 행', plan.trainRows.length],
+    ['규칙', '자가용 G열/H열은 수정하지 않음'],
+    ['규칙', '방문활동에 퇴근지점이 빠져 있으면 근태관리 퇴근지점을 추가 경유지로 반영'],
+    ['규칙', '방문활동이 없고 주유결제만 있으면 코스트코 혁신점 방문으로 간주'],
+    ['규칙', 'SR/SRT/KTX 결제일은 자가용 제외 후 대중교통으로 작성'],
+    ['규칙', '대중교통 F열은 카드 승인금액 전체 입력'],
+    ...plan.warnings.map(w => ['주의', w])
+  ]);
+}
+
+function findWorksheet(workbook, keyword) {
+  return workbook.worksheets.find(ws => String(ws.name).includes(keyword));
+}
+
+function buildDbRouteMap(templateBook, addressDb) {
+  const map = new Map();
+  const ws = templateBook.Sheets[TEMPLATE_DB_SHEET];
+  if (!ws) return map;
+  const rows = XLSX.utils.sheet_to_json(ws, { header: 1, raw: false, defval: '' });
+  rows.slice(1).forEach(row => {
+    const from = resolvePlaceName(row[6], addressDb);
+    const to = resolvePlaceName(row[7], addressDb);
+    const km = parseNumber(row[8]);
+    const toll = parseNumber(row[9]);
+    if (!from || !to || !Number.isFinite(km)) return;
+    const value = { distanceKm: km, toll: Number.isFinite(toll) ? toll : 0 };
+    map.set(routeKey(from, to), value);
+    if (!map.has(routeKey(to, from))) map.set(routeKey(to, from), value);
+  });
+  return map;
+}
+
+function resolvePlaceName(value, addressDb) {
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+  if (/^(자택|집|우리집)$/i.test(raw.replace(/\s+/g, ''))) return '자택';
+  const key = normalizeKey(raw);
+  if (addressDb.aliasToName.has(key)) return addressDb.aliasToName.get(key);
+
+  for (const [name, loc] of addressDb.locations.entries()) {
+    if (loc.type === '매장') {
+      const compactStore = normalizeKey(name.replace(/코스트코/g, '').replace(/점$/g, ''));
+      if (compactStore && key.includes(compactStore)) return name;
+      if (key.includes('대구혁신') && normalizeKey(name).includes('혁신')) return name;
+    }
+    if (loc.type === '사무실') {
+      const compactOffice = normalizeKey(name.replace(/사무실|사무소/g, ''));
+      if (compactOffice && key.includes(compactOffice) && key.includes('사무')) return name;
+    }
+  }
+  return raw;
+}
+
+function resolveLocation(name, addressDb) {
+  if (name === '자택') return addressDb.home;
+  const canonical = resolvePlaceName(name, addressDb);
+  const loc = addressDb.locations.get(canonical);
+  if (!loc) throw new Error(`주소DB에 장소가 없습니다: ${name}`);
+  if (!loc.address) throw new Error(`주소가 비어 있습니다: ${canonical}`);
+  return loc;
+}
+
+function normalizePersonName(value) {
+  return String(value || '').replace(/\s+/g, '').trim();
+}
+function samePerson(a, b) { return normalizePersonName(a) === normalizePersonName(b); }
+function normalizeDisplayName(value) { return String(value || '').trim().replace(/\s+/g, ' '); }
+function normalizeKey(value) { return String(value || '').toLowerCase().replace(/[\s\-_/()\[\]{}.,，·ㆍ:：]/g, '').trim(); }
+
+function makeFullAddress(address, city) {
+  const raw = String(address || '').trim();
+  const c = String(city || '').trim();
+  if (!raw || !c) return raw;
+  const prefixes = ['서울', '부산', '대구', '인천', '광주', '대전', '울산', '세종', '경기', '경기도', '강원', '충북', '충청북도', '충남', '충청남도', '전북', '전라북도', '전남', '전라남도', '경북', '경상북도', '경남', '경상남도', '제주'];
+  if (raw.startsWith(c) || prefixes.some(p => raw.startsWith(p))) return raw;
+  const parts = c.split(/\s+/).filter(Boolean);
+  if (parts.length >= 2 && raw.startsWith(parts[1])) return `${parts[0]} ${raw}`.replace(/\s+/g, ' ').trim();
+  return `${c} ${raw}`.replace(/\s+/g, ' ').trim();
+}
+
+function inferCity(name, address = '') {
+  const text = `${name} ${address}`;
+  if (text.includes('대구')) return '대구광역시';
+  if (text.includes('부산')) return '부산광역시';
+  if (text.includes('대전')) return '대전광역시';
+  if (text.includes('세종')) return '세종특별자치시';
+  if (text.includes('천안')) return '충청남도 천안시';
+  if (text.includes('김해')) return '경상남도 김해시';
+  if (text.includes('울산')) return '울산광역시';
+  if (text.includes('양산')) return '경상남도 양산시';
+  if (text.includes('서울') || ['양재', '양평', '상봉', '고척'].some(v => text.includes(v))) return '서울특별시';
+  if (text.includes('인천') || text.includes('송도') || text.includes('청라')) return '인천광역시';
+  if (text.includes('광명')) return '경기도 광명시';
+  if (text.includes('하남')) return '경기도 하남시';
+  if (text.includes('의정부')) return '경기도 의정부시';
+  if (text.includes('공세') || text.includes('용인')) return '경기도 용인시';
+  if (text.includes('일산') || text.includes('고양')) return '경기도 고양시';
+  if (text.includes('평택')) return '경기도 평택시';
+  return '';
+}
+
+function cityKey(cityOrAddress) {
+  const text = String(cityOrAddress || '');
+  const specials = ['서울', '부산', '대구', '인천', '광주', '대전', '울산', '세종'];
+  for (const s of specials) if (text.includes(s)) return s;
+  const m = text.match(/([가-힣]+)시/);
+  if (m) return m[1];
+  const gun = text.match(/([가-힣]+)군/);
+  if (gun) return gun[1];
+  return text.split(/\s+/)[0] || text;
+}
+
+function cityShort(placeName, addressDb) {
+  const loc = resolveLocation(placeName, addressDb);
+  return loc.cityKey || cityKey(loc.city || loc.address || loc.name);
+}
+
+function groupBy(rows, fn) {
+  const map = new Map();
+  rows.forEach(row => {
+    const key = fn(row);
+    if (!key) return;
+    if (!map.has(key)) map.set(key, []);
+    map.get(key).push(row);
+  });
+  return map;
+}
+
+function toDateKey(value) {
+  if (value == null || value === '') return '';
+  if (value instanceof Date) return dateToKey(value);
+  const raw = String(value).trim();
+  const digits = raw.replace(/[^0-9]/g, '');
+  if (digits.length >= 8) return digits.slice(0, 8);
+  return '';
+}
+function dateToKey(d) { return `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, '0')}${String(d.getDate()).padStart(2, '0')}`; }
+function keyToDate(key) { return new Date(Number(key.slice(0, 4)), Number(key.slice(4, 6)) - 1, Number(key.slice(6, 8))); }
+function dateDisplay(key) { return `${Number(key.slice(4, 6))}/${Number(key.slice(6, 8))}`; }
+
+function toMoney(value) {
+  if (typeof value === 'number') return Math.round(value);
+  const text = String(value || '').replace(/,/g, '').replace(/원/g, '').replace(/\s+/g, '').trim();
+  if (!text) return 0;
+  const n = Number(text);
+  return Number.isFinite(n) ? Math.round(n) : 0;
+}
+function parseNumber(value) {
+  const n = Number(String(value || '').replace(/[^0-9.\-]/g, ''));
+  return Number.isFinite(n) ? n : NaN;
+}
+function trainType(merchant) {
+  const text = String(merchant || '').toUpperCase();
+  if (text.includes('SRT')) return 'SRT';
+  if (text.includes('KTX')) return 'KTX';
+  if (text.includes('SR')) return 'SR';
+  if (text.includes('KORAIL') || text.includes('코레일') || text.includes('한국철도')) return 'KTX';
+  return '기차';
+}
+function routeKey(a, b) { return `${normalizeKey(a)}→${normalizeKey(b)}`; }
+function round1(value) { return Math.round(Number(value || 0) * 10) / 10; }
+function formatWon(value) { return Number(value || 0).toLocaleString('ko-KR'); }
+
+function renderPreview(plan, addressDb) {
+  const carRows = plan.carRows.map((r, i) => `<tr><td>${i + 1}</td><td>${dateDisplay(r.dateKey)}</td><td>${r.start}</td><td>${r.end}</td><td>${r.fuelTotal ? formatWon(r.fuelTotal) : ''}</td><td>${r.isReturnHome ? '자택 복귀' : ''}</td></tr>`).join('');
+  const trainRows = plan.trainRows.map((r, i) => `<tr><td>${i + 1}</td><td>${dateDisplay(r.dateKey)}</td><td>${r.item}</td><td>${r.destination}</td><td>${r.reason}</td><td>${formatWon(r.amount)}</td></tr>`).join('');
+  const warnings = plan.warnings.length ? `<h3>주의/보정</h3><ul>${plan.warnings.map(w => `<li>${escapeHtml(w)}</li>`).join('')}</ul>` : '';
+  els.preview.innerHTML = `
+    <h2>미리보기</h2>
+    <h3>자가용</h3>
+    <table><thead><tr><th>No</th><th>날짜</th><th>출발</th><th>도착</th><th>주유</th><th>비고</th></tr></thead><tbody>${carRows || '<tr><td colspan="6">없음</td></tr>'}</tbody></table>
+    <h3>대중교통</h3>
+    <table><thead><tr><th>No</th><th>날짜</th><th>항목</th><th>행선지</th><th>사유</th><th>금액</th></tr></thead><tbody>${trainRows || '<tr><td colspan="6">없음</td></tr>'}</tbody></table>
+    ${warnings}`;
+  els.preview.style.display = 'block';
+}
+function escapeHtml(value) { return String(value).replace(/[&<>"]/g, m => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[m])); }
+
+function printPlan(plan) {
+  log('\n🚗 자가용 작성 예정');
+  if (!plan.carRows.length) log('  - 없음');
+  plan.carRows.forEach((r, i) => log(`  ${i + 1}. ${dateDisplay(r.dateKey)} ${r.start} → ${r.end}${r.fuelTotal ? ` / 주유 ${formatWon(r.fuelTotal)}원` : ''}${r.isReturnHome ? ' / 자택 복귀' : ''}`));
+  log('\n🚆 대중교통 작성 예정');
+  if (!plan.trainRows.length) log('  - 없음');
+  plan.trainRows.forEach((r, i) => log(`  ${i + 1}. ${dateDisplay(r.dateKey)} ${r.item} / ${r.destination} / ${r.reason} / ${formatWon(r.amount)}원`));
+  if (plan.warnings.length) {
+    log('\n⚠️ 보정/주의');
+    plan.warnings.forEach(w => log(`  - ${w}`));
+  }
+}
+
+function makeOutputName(plan, employeeName) {
+  const dateKey = plan.carRows[0]?.dateKey || plan.trainRows[0]?.dateKey || dateToKey(new Date());
+  return `이동경비_자동작성_${employeeName}_${dateKey.slice(0, 6)}.xlsx`;
+}

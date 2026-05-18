@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>TMAP 차량 이동 및 대중교통 자동 작성 HUB</title>
+  <style>
+    :root { --bg:#0f172a; --card:#111827; --line:#334155; --text:#e5e7eb; --muted:#94a3b8; --accent:#38bdf8; --ok:#22c55e; --warn:#f59e0b; --bad:#ef4444; }
+    *{box-sizing:border-box} body{margin:0;font-family:Arial,'Apple SD Gothic Neo','Malgun Gothic',sans-serif;background:linear-gradient(135deg,#020617,#111827);color:var(--text)}
+    header{padding:34px 20px 18px;border-bottom:1px solid var(--line)} .wrap{max-width:1120px;margin:0 auto}
+    h1{margin:0;font-size:28px;letter-spacing:-.5px} p{line-height:1.55;color:var(--muted)}
+    main{max-width:1120px;margin:0 auto;padding:22px 20px 50px}.notice{border:1px solid #075985;background:rgba(14,165,233,.12);padding:16px;border-radius:16px;margin-bottom:18px;line-height:1.55}
+    .grid{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:14px}.card{background:rgba(17,24,39,.9);border:1px solid var(--line);border-radius:18px;padding:16px;box-shadow:0 12px 30px rgba(0,0,0,.25)}
+    .card h2{font-size:16px;margin:0 0 7px}.card small{display:block;color:var(--muted);min-height:36px;line-height:1.4}.filebox{margin-top:12px;border:1px dashed #475569;border-radius:14px;padding:12px;background:#0b1220}input[type=file]{width:100%;color:var(--muted)}
+    .controls{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:18px 0}.btn{border:0;border-radius:12px;padding:12px 16px;font-weight:700;cursor:pointer;color:#001018;background:var(--accent)}.btn.secondary{background:#334155;color:var(--text)}.btn:disabled{opacity:.45;cursor:not-allowed}
+    .badge{border-radius:999px;padding:8px 12px;font-size:13px;font-weight:700}.green{background:rgba(34,197,94,.15);color:#86efac;border:1px solid rgba(34,197,94,.4)}.amber{background:rgba(245,158,11,.15);color:#fcd34d;border:1px solid rgba(245,158,11,.4)}.red{background:rgba(239,68,68,.15);color:#fca5a5;border:1px solid rgba(239,68,68,.4)}
+    .kpi{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:18px}.kpi .card{padding:14px}.num{font-size:26px;font-weight:800;color:#fff}.label{color:var(--muted);font-size:13px}.log{white-space:pre-wrap;background:#020617;border:1px solid var(--line);border-radius:16px;padding:14px;min-height:250px;max-height:430px;overflow:auto;font-size:13px;line-height:1.55}.download{display:inline-block;margin-top:12px;color:#001018;background:var(--ok);padding:12px 16px;border-radius:12px;font-weight:800;text-decoration:none}
+    table{width:100%;border-collapse:collapse;margin-top:12px;font-size:13px}th,td{border-bottom:1px solid #1f2937;padding:8px;text-align:left;vertical-align:top}th{color:#bae6fd;background:#0b1220;position:sticky;top:0}.previewBox{margin-top:16px;overflow:auto;max-height:360px}
+    @media(max-width:980px){.grid{grid-template-columns:1fr 1fr}.kpi{grid-template-columns:1fr 1fr}}@media(max-width:560px){.grid,.kpi{grid-template-columns:1fr}}
+  </style>
+</head>
+<body>
+  <header><div class="wrap"><h1>TMAP 차량 이동 및 대중교통 자동 작성 HUB</h1><p>주소DB, 이동 양식, 방문활동관리, 근태관리, 카드승인내역 5개 파일을 넣으면 이동 양식에 자동 작성합니다.</p></div></header>
+  <main>
+    <div class="notice">
+      <b>사용 순서:</b> ① 파일 5개 업로드 → ② 분석/미리보기 → ③ 완성본 다운로드<br>
+      작성자는 이동 양식의 <b>F4 또는 F3</b>에서 자동 인식하고, 주소DB의 <b>B열 이름</b> 기준 자택/사무실을 찾습니다. TMAP 키는 Vercel 환경변수 <b>TMAP_APP_KEY</b>에만 넣으세요.
+    </div>
+    <section class="grid">
+      <div class="card"><h2>1. 주소DB</h2><small>구분/이름/표시명/주소/시도/시군구/별칭</small><div class="filebox"><input id="addressFile" type="file" accept=".xlsx,.xls,.csv"></div></div>
+      <div class="card"><h2>2. 이동 양식</h2><small>자가용/대중교통/DB 시트 포함 원본 양식</small><div class="filebox"><input id="templateFile" type="file" accept=".xlsx"></div></div>
+      <div class="card"><h2>3. 방문활동관리</h2><small>방문날짜/방문시간/매장명/이름</small><div class="filebox"><input id="visitFile" type="file" accept=".xlsx,.xls,.csv"></div></div>
+      <div class="card"><h2>4. 근태관리</h2><small>이름/근무일자/출근지점/퇴근지점</small><div class="filebox"><input id="attendanceFile" type="file" accept=".xlsx,.xls,.csv"></div></div>
+      <div class="card"><h2>5. 카드승인내역</h2><small>승인일자/승인시간/가맹점명/승인금액</small><div class="filebox"><input id="cardFile" type="file" accept=".xlsx,.xls,.csv"></div></div>
+    </section>
+    <div class="controls">
+      <button id="analyzeBtn" class="btn">분석/미리보기</button>
+      <button id="generateBtn" class="btn">완성본 생성</button>
+      <button id="resetBtn" class="btn secondary">초기화</button>
+      <span id="statusBadge" class="badge amber">대기</span>
+    </div>
+    <section class="kpi">
+      <div class="card"><div id="employeeName" class="num">-</div><div class="label">작성자</div></div>
+      <div class="card"><div id="carCount" class="num">0</div><div class="label">자가용 행</div></div>
+      <div class="card"><div id="trainCount" class="num">0</div><div class="label">대중교통 행</div></div>
+      <div class="card"><div id="fuelTotal" class="num">0</div><div class="label">주유 합계</div></div>
+    </section>
+    <div class="card"><h2>진행 상태</h2><div id="log" class="log">파일을 올린 뒤 [분석/미리보기] 또는 [완성본 생성]을 누르세요.</div><a id="downloadLink" class="download" hidden>완성본 다운로드</a></div>
+    <div id="preview" class="card previewBox" style="display:none"></div>
+  </main>
+  <script src="https://cdn.jsdelivr.net/npm/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/exceljs@4.4.0/dist/exceljs.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/file-saver@2.0.5/dist/FileSaver.min.js"></script>
+  <script src="./app.js"></script>
+</body>
+</html>
