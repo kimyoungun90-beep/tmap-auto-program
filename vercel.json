@@ -1,14 +1,3 @@
 {
-  "version": 2,
-  "functions": {
-    "api/tmap-route.js": {
-      "runtime": "nodejs20.x"
-    }
-  },
-  "rewrites": [
-    {
-      "source": "/api/tmap-route",
-      "destination": "/api/tmap-route.js"
-    }
-  ]
+  "version": 2
 }
